@@ -49,6 +49,8 @@
 #include "printf.h"
 #include "sensor_payload.h"   // Payload Definition, enclosed in MaStation Git Repository
 #include "WS2355_RF2NRF.h"
+#include <Wire.h>             // Wire Library
+#include <Adafruit_BMP085.h>  //BMP085 Library  https://github.com/adafruit/Adafruit-BMP085-Library
 
 //
 // Hardware configuration for NRF24L01
@@ -80,8 +82,16 @@ Rf In => pin d8
 #define NRF24L01_USE_ACK false	// Set auto ACK configuration Options.
 RF24 radio(NRF24L01_CE_PIN, NRF24L01_CSN_PIN); // Set up nRF24L01 radio on SPI bus plus pins CE, CSN
 // NRF24 Radio pipe addresses for the 2 nodes to communicate, only one used actually
-const uint64_t pipes[3] = { 0xF0F0F0F0E1LL, 0xF0F0F0F0D2LL, 0xE8E8F0F0E1LL };
+const uint64_t pipes[2] = { 0xF0F0F0F0D2LL, 0xF0F0F0F0D1LL }; //
+// Receiver Station @NRF24 => 0xF0F0F0F0E3LL
+// Emitter  Station @NRF24: 0xF0F0F0F0E1LL
 #define STATION_NODE 11
+
+//*****************************
+// * BMP085 CONFIGURATION
+Adafruit_BMP085 bmp;
+#define STATION_KNOWN_ALTITUDE 162  // You might use http://www.daftlogic.com/sandbox-google-maps-find-altitude.htm to identify yours
+
 
 // Payload Structure
 typedef struct { // WS2355 FIFO Of Payload
@@ -98,6 +108,10 @@ WS2355_AOP FIFO_WS2355_AOP[MAX_FIFO_WS2355_AOP];
 
 Payload payload = (Payload) {
   SENSOR_STATION
+};
+
+Payload payloadbmp = (Payload) {
+  WS2355_BMP
 };
 
 /*--------------------------------------------------------------------------------------
@@ -145,67 +159,80 @@ unsigned long ulWSR_Rainfall_mm_x10;
 // Uncomment for a debug build
 //#define DEBUG 1
 
+/*********************************************************************************
+ * doSendMsg()
+ *  Sent Msg To Station
+********************************************************************************/
 bool doSendMsg()
 {
   radio.stopListening();
-  if (radio.available()) {
-    printf("Data to read, please check.\n");
-  }
-  if (NRF24L01_USE_ACK) {
-    bool done = (radio.write(&payload, sizeof(payload)));
-    if (done) {
-#ifdef DEBUG
-      printf("OK %d ", payload.type);
-#endif
-    }
-    else {
-#ifdef DEBUG
-      printf("NOK ");
-      //printf("Transmission -> (%d) OK\t",sizeof(payload));
-#endif
-    }
-#ifdef DEBUG
-    printf("Tr %d bytes / max %u -> [%u/%u/%u]\n", sizeof(payload), radio.getPayloadSize(), done, true, radio.isAckPayloadAvailable());
-#endif
+  radio.openWritingPipe(pipes[0]);
+  bool done = radio.write(&payload, sizeof(payload));
+  if (done) {
+    printf("OK %d ", payload.type);
   }
   else {
-    radio.startWrite(&payload, sizeof(payload));
-#ifdef DEBUG
-    printf("NO ACK Payload sent ");
-#endif
+    printf("NOK ");
   }
+  printf("Tr %d bytes / max %u -> [%u/%u/%u]\n", sizeof(payload), radio.getPayloadSize(), done, true, radio.isAckPayloadAvailable());
   radio.startListening();
-  delay(500);
 }
 
-
+/********************************************************************************
+ * DoSendBMP
+ * 
+ *******************************************************************************/
+bool doSendBMP() {
+    payloadbmp.type = WS2355_BMP;
+    payloadbmp.data.SENSOR_BMP085.temperature = bmp.readTemperature();
+    payloadbmp.data.SENSOR_BMP085.Pressure = bmp.readSealevelPressure(STATION_KNOWN_ALTITUDE);
+    payloadbmp.data.SENSOR_BMP085.Altitude = bmp.readAltitude(bmp.readSealevelPressure(STATION_KNOWN_ALTITUDE) );
+    payloadbmp.data.SENSOR_BMP085.status = 1;
+    Serial.print("BMP080 SENSOR: ");
+    Serial.print("Temp     ="); Serial.print(payloadbmp.data.WS2355_BMP.temperature, DEC);
+    Serial.print(" Pressure ="); Serial.print(payloadbmp.data.WS2355_BMP.Pressure, DEC);
+    Serial.print(" Altitude ="); Serial.println(payloadbmp.data.WS2355_BMP.Altitude, DEC);
+  radio.stopListening();
+  radio.openWritingPipe(pipes[0]);
+  bool done = radio.write(&payloadbmp, sizeof(payloadbmp));
+  if (done) {
+    printf("OK %d ", payloadbmp.type);
+  }
+  else {
+    printf("NOK ");
+  }
+  printf("Tr %d bytes / max %u -> [%u/%u/%u]\n", sizeof(payloadbmp), radio.getPayloadSize(), done, true, radio.isAckPayloadAvailable());
+  radio.startListening();
+} 
+ 
+ 
 /**
  * Initial configuration
  */
 void setup(void)
 {
-  Serial.begin( 115200 );   //using the serial port at 115200bps for debugging and logging
-  Serial.println( "Weather Station Receiver has powered up" );
+  Serial.begin( 57600 );   //using the serial port for debugging and logging
   printf_begin();
+  printf("Weather Station Receiver has powered up\n" );
+  radio.begin(); 
   // NRF24 init
-  radio.begin(); // Setup and configure 2.4ghz rf radio
-  radio.stopListening();
-  radio.setRetries(15, 15);
+  printf("\nPreparing NRF24L01 interface\n");
+  radio.setRetries(15, 15); // Wait 250µs x7 Times
+  radio.setPALevel(RF24_PA_MAX);
   radio.setChannel(120);
-  //radio.disableCRC(); //CRC enabled by default
-  radio.enableAckPayload();
-  radio.setAutoAck(NRF24L01_USE_ACK);
-  radio.openWritingPipe(pipes[1]);
-  radio.openReadingPipe(1, pipes[0]); // Not used reading actually
-  radio.openReadingPipe(2, pipes[2]); // Not used reading actually
-  //  radio.openReadingPipe(3, pipes[2]); // Not used reading actually
-  radio.printDetails();
-  //NRF24L01_databuf[0] = STATION_NODE; // Assign Station Node
-  if (radio.testRPD()) {
-    printf("Warning Channel is busy\n!!");
-  }
+  radio.openWritingPipe(pipes[0]);
+  radio.openReadingPipe(1, pipes[1]);
+  radio.startListening();
   radio.powerUp();
+  radio.printDetails();
   printf("//NRF24 Module Sensor Enabled.\n");
+  // BMP085 init
+  if (!bmp.begin()) {
+    printf("Could not find a valid BMP085 sensor, check wiring!\n");
+  } else
+  {
+    printf("//BMP085 Module Sensor Enabled.\n");
+  }  
   payload.Version = PAYLOAD_VERSION; // initialize data for all payload -- PAYLOAD_VERSION; from sensor_payload.h
   payload.Station_id = STATION_NODE; // initialize data for all payload
   payload.Node = 0; // Master primary
@@ -214,6 +241,12 @@ void setup(void)
   payload.data.SENSOR_STATION.Power_Voltage = 0 ;
   payload.data.SENSOR_STATION.status = 199;
   doSendMsg();
+  delay(1000);
+  payloadbmp.Version = PAYLOAD_VERSION; // initialize data for all payload -- PAYLOAD_VERSION; from sensor_payload.h
+  payloadbmp.Station_id = STATION_NODE; // initialize data for all payload
+  payloadbmp.Node = 0; // Master primary
+  doSendBMP();
+  
   int i;
   for (i = 0; i < MAX_FIFO_WS2355_AOP; i++) {
     FIFO_WS2355_AOP[i].sent = true;
@@ -242,6 +275,7 @@ void loop(void)
 
   if (FIFO_WS2355_AOP_PUSH > (MAX_FIFO_WS2355_AOP - 1)) {
     FIFO_WS2355_AOP_PUSH = 0;
+    doSendBMP();
   }
   int i;
   for (int ti = FIFO_WS2355_AOP_PUSH; ti < (FIFO_WS2355_AOP_PUSH + MAX_FIFO_WS2355_AOP); ti++ ) {
@@ -265,13 +299,9 @@ void loop(void)
         }
       }
       printf("Send data from %u", i);
-      if (radio.available()) {
-        printf("Radio Data.\n");
-      }
       radio.stopListening();
-      if (NRF24L01_USE_ACK) {
-        bool done = (radio.write(&FIFO_WS2355_AOP[i].payload, sizeof(FIFO_WS2355_AOP[i].payload)));
-        if (done) {
+      bool done = (radio.write(&FIFO_WS2355_AOP[i].payload, sizeof(FIFO_WS2355_AOP[i].payload)));
+      if (done) {
 #ifdef DEBUG
           printf("NRF24L01: OK %d ", FIFO_WS2355_AOP[i].payload.type);
 #endif
@@ -283,16 +313,7 @@ void loop(void)
 #ifdef DEBUG
         printf("Tr %d bytes / max %u -> [%u/%u/%u]\n", sizeof(FIFO_WS2355_AOP[i].payload), radio.getPayloadSize(), done, true, radio.isAckPayloadAvailable());
 #endif
-      }
-      else {
-        radio.startWrite(&FIFO_WS2355_AOP[i].payload, sizeof(FIFO_WS2355_AOP[i].payload));
-        FIFO_WS2355_AOP[i].sent = true;
-#ifdef DEBUG
-        printf("NRF24L01: NO ACK sent \n");
-#endif
-      }
-      delay(500);
-      radio.startListening();
+      delay(50);
     }
   }
 }
